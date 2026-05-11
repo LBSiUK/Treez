@@ -1,0 +1,10 @@
+__pycache__/
+build/
+dist/
+*.pyc
+*.log
+*.bak
+settings.json
+api_keys.py
+.env
+.env.*
