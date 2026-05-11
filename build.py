@@ -14,7 +14,7 @@ TEMP_DIR = os.path.join(os.environ.get("TEMP", os.path.join(BASE_DIR, "_tmp")), 
 VENV_DIR = os.path.join(TEMP_DIR, "venv")
 VENV_PY  = os.path.join(VENV_DIR, "Scripts", "python.exe")
 
-ICON     = os.path.join(BASE_DIR, "simple-tree-decor-silhouette-vector-600nw-1710053998.ico")
+ICON     = os.path.join(BASE_DIR, "treez.ico")
 ADD_DATA = f"{ICON};."
 
 PACKAGES = [

@@ -1311,7 +1311,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     # Locate the .ico whether running as a script or a frozen PyInstaller exe
     _bundle_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    _icon = os.path.join(_bundle_dir, "simple-tree-decor-silhouette-vector-600nw-1710053998.ico")
+    _icon = os.path.join(_bundle_dir, "treez.ico")
     if os.path.exists(_icon):
         root.iconbitmap(_icon)
     App(root)
