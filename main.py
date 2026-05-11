@@ -191,7 +191,7 @@ CAT_COLORS = [
 GROK_BASE_URL = "https://api.groq.com/openai/v1"
 GROK_MODEL    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-APP_VERSION  = "1.0.0"
+APP_VERSION  = "1.0.1"
 GITHUB_OWNER = "011-sam-110"
 GITHUB_REPO  = "Treez"
 
@@ -409,7 +409,7 @@ class App:
         )
         self.wifi_label.pack(side="left", padx=(0, 10))
 
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="Ready  |  v" + APP_VERSION)
         tk.Label(status_bar, textvariable=self.status_var,
                  font=("Segoe UI", 10), bg=p["surface"], fg=p["text3"]).pack(side="left")
 
