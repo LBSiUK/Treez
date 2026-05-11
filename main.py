@@ -4,10 +4,12 @@ Tap phrase buttons to build a description, then GO types it automatically.
 
 Dependencies: pip install pyautogui pyperclip openai
 """
+import http.server
 import json
 import logging
 import os
 import socket
+import socketserver as _sserver
 import sys
 import threading
 import tkinter as tk
@@ -30,6 +32,12 @@ try:
     AI_OK = True
 except ImportError:
     AI_OK = False
+
+try:
+    import qrcode as _qrcode_lib
+    QR_OK = True
+except ImportError:
+    QR_OK = False
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.join(
@@ -191,9 +199,84 @@ CAT_COLORS = [
 GROK_BASE_URL = "https://api.groq.com/openai/v1"
 GROK_MODEL    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-APP_VERSION  = "1.0.1"
+APP_VERSION  = "1.0.2"
 GITHUB_OWNER = "011-sam-110"
 GITHUB_REPO  = "Treez"
+
+# ── Mobile web UI served to the phone ─────────────────────────────────────────
+_MOBILE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Survey Input</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{display:flex;flex-direction:column;background:#0D1117;color:#E6EDF3;
+     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+#hdr{background:#161B22;border-bottom:1px solid #30363D;padding:12px 16px;
+     display:flex;align-items:center;gap:10px;flex-shrink:0}
+#dot{width:9px;height:9px;border-radius:50%;background:#f85149;transition:background .3s;flex-shrink:0}
+#dot.on{background:#3fb950}
+#hdr h1{font-size:16px;font-weight:600;flex:1}
+#sync{font-size:12px;color:#8B949E;white-space:nowrap}
+#ta{flex:1;background:#0D1117;color:#E6EDF3;border:none;outline:none;
+    resize:none;padding:16px;font-size:19px;line-height:1.6;width:100%;
+    -webkit-appearance:none}
+#ftr{background:#161B22;border-top:1px solid #30363D;padding:10px 14px;
+     display:flex;gap:10px;flex-shrink:0}
+.btn{flex:1;padding:15px;font-size:17px;font-weight:700;border:none;
+     border-radius:8px;cursor:pointer;-webkit-tap-highlight-color:transparent}
+#bGo{background:#238636;color:#fff}
+#bGo:active{background:#2ea043}
+#bClear{background:#21262D;color:#E6EDF3;flex:0 0 90px}
+#bClear:active{background:#30363D}
+</style>
+</head>
+<body>
+<div id="hdr">
+  <div id="dot"></div>
+  <h1>Survey Input</h1>
+  <span id="sync">connecting…</span>
+</div>
+<textarea id="ta" autocomplete="off" autocorrect="off"
+  autocapitalize="off" spellcheck="false"
+  placeholder="Tap to type…"></textarea>
+<div id="ftr">
+  <button class="btn" id="bClear" onclick="doClear()">Clear</button>
+  <button class="btn" id="bGo"    onclick="doGo()">GO ›</button>
+</div>
+<script>
+var ta=document.getElementById('ta'),dot=document.getElementById('dot'),sync=document.getElementById('sync');
+var ver=0,typing=false,timer,ptimer;
+ta.addEventListener('input',function(){
+  typing=true;clearTimeout(timer);
+  timer=setTimeout(function(){typing=false;push();},700);
+});
+function push(){
+  fetch('/update',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:ta.value})})
+  .then(r=>r.json()).then(d=>{ver=d.version;dot.className='on';sync.textContent='synced';})
+  .catch(()=>{dot.className='';sync.textContent='offline';});
+}
+function poll(){
+  if(typing){ptimer=setTimeout(poll,600);return;}
+  fetch('/state?v='+ver)
+  .then(r=>r.json()).then(d=>{
+    dot.className='on';
+    if(d.version!==ver){ver=d.version;ta.value=d.text;sync.textContent='updated';}
+    else{sync.textContent='live';}
+    ptimer=setTimeout(poll,600);
+  })
+  .catch(()=>{dot.className='';sync.textContent='reconnecting…';ptimer=setTimeout(poll,2000);});
+}
+function doClear(){ta.value='';push();}
+function doGo(){push();fetch('/go',{method:'POST'});}
+poll();
+</script>
+</body>
+</html>"""
 
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
@@ -277,6 +360,190 @@ def _hover(w, nbg, hbg, nfg, hfg=None):
     w.bind("<Leave>", lambda _e: w.config(bg=nbg, fg=nfg))
 
 
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _draw_qr(canvas: tk.Canvas, url: str, size: int):
+    if not QR_OK:
+        return
+    qr = _qrcode_lib.QRCode(
+        error_correction=_qrcode_lib.constants.ERROR_CORRECT_M,
+        box_size=1, border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    n = len(matrix)
+    cell = max(1, size // n)
+    for r, row in enumerate(matrix):
+        for c, val in enumerate(row):
+            if val:
+                x0, y0 = c * cell, r * cell
+                canvas.create_rectangle(x0, y0, x0 + cell, y0 + cell,
+                                        fill="#000000", outline="")
+
+
+_CF_EXE = os.path.join(BASE_DIR, "cloudflared.exe")
+_CF_DL  = ("https://github.com/cloudflare/cloudflared/releases/latest"
+           "/download/cloudflared-windows-amd64.exe")
+_CF_URL_RE = __import__("re").compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+
+def _find_cloudflared() -> str | None:
+    import shutil
+    if os.path.exists(_CF_EXE):
+        return _CF_EXE
+    return shutil.which("cloudflared") or shutil.which("cloudflared.exe")
+
+
+def _download_cloudflared(on_progress) -> str:
+    """Download cloudflared.exe; calls on_progress(pct) periodically."""
+    import urllib.request
+    on_progress(0)
+    with urllib.request.urlopen(_CF_DL, timeout=60) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        received = 0
+        chunk = 65536
+        with open(_CF_EXE, "wb") as f:
+            while True:
+                data = resp.read(chunk)
+                if not data:
+                    break
+                f.write(data)
+                received += len(data)
+                if total:
+                    on_progress(int(received / total * 100))
+    on_progress(100)
+    return _CF_EXE
+
+
+def _launch_cf_tunnel(port: int, on_url, on_error) -> "subprocess.Popen":
+    import subprocess
+    cf = _find_cloudflared()
+    proc = subprocess.Popen(
+        [cf, "--no-autoupdate", "tunnel", "--url", f"http://localhost:{port}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+    def _read():
+        try:
+            for line in proc.stdout:
+                m = _CF_URL_RE.search(line)
+                if m:
+                    on_url(m.group())
+                    return
+            on_error("Tunnel closed without providing a URL")
+        except Exception as exc:
+            on_error(str(exc))
+
+    threading.Thread(target=_read, daemon=True).start()
+    return proc
+
+
+# ── Mobile HTTP server ────────────────────────────────────────────────────────
+
+class _MobileHTTPServer(_sserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr, handler, ms):
+        super().__init__(addr, handler)
+        self.ms = ms
+
+
+class _MobileHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass  # silence request logs
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            body = _MOBILE_HTML.encode("utf-8")
+            self._respond(200, "text/html; charset=utf-8", body)
+        elif self.path.startswith("/state"):
+            text, version = self.server.ms.get_state()
+            body = json.dumps({"text": text, "version": version}).encode()
+            self._respond(200, "application/json", body)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        if self.path == "/update":
+            try:
+                data = json.loads(raw)
+                version = self.server.ms.phone_update(data.get("text", ""))
+                self._respond(200, "application/json",
+                              json.dumps({"version": version}).encode())
+            except Exception:
+                self.send_error(400)
+        elif self.path == "/go":
+            self.server.ms.phone_go()
+            self._respond(200, "application/json", b"{}")
+        else:
+            self.send_error(404)
+
+    def _respond(self, code, ctype, body):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", len(body))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class MobileServer:
+    def __init__(self, app: "App"):
+        self.app = app
+        self._text = app.sentence_text.get("1.0", "end-1c")
+        self._version = 0
+        self._lock = threading.Lock()
+        self._cf_proc = None
+        self._httpd = _MobileHTTPServer(("", 0), _MobileHandler, self)
+        self.port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        log.info("Mobile server started on port %d", self.port)
+
+    def stop(self):
+        if self._cf_proc and self._cf_proc.poll() is None:
+            self._cf_proc.terminate()
+            self._cf_proc = None
+        self._httpd.shutdown()
+        log.info("Mobile server stopped")
+
+    def get_state(self):
+        with self._lock:
+            return self._text, self._version
+
+    def set_text(self, text: str):
+        """Called from the main thread when the desktop sentence changes."""
+        with self._lock:
+            if self._text == text:
+                return
+            self._text = text
+            self._version += 1
+
+    def phone_update(self, text: str) -> int:
+        """Called from an HTTP thread; schedules a main-thread update."""
+        with self._lock:
+            self._text = text
+            self._version += 1
+            v = self._version
+        self.app.root.after(0, lambda t=text: self.app._apply_mobile_text(t))
+        return v
+
+    def phone_go(self):
+        self.app.root.after(0, self.app._go)
+
+
 # ── Scrollable frame ──────────────────────────────────────────────────────────
 
 class ScrollableFrame(tk.Frame):
@@ -325,6 +592,10 @@ class App:
         self._tab_frames: dict = {}
         self._active_tab: str | None = None
         self.sugg_container = None
+        self._mobile_server: "MobileServer | None" = None
+        self._mobile_win: "MobileWindow | None" = None
+        self._mobile_updating = False
+        self._mobile_sync_job = None
 
         root.title("Survey Sentence Generator")
         root.geometry(self.settings.get("geometry", DEFAULT_SETTINGS["geometry"]))
@@ -479,6 +750,7 @@ class App:
 
         self.edit_btn = self._header_btn(header, "Edit Phrases", self._toggle_edit)
         self.edit_btn.pack(side="right", padx=(8, 0))
+        self._header_btn(header, "Mobile", self._open_mobile).pack(side="right", padx=(8, 0))
         self._header_btn(header, "Settings", self._open_settings).pack(side="right")
 
         # Sentence panel
@@ -504,6 +776,8 @@ class App:
             selectforeground=p["text"],
         )
         self.sentence_text.pack(fill="x")
+        self.sentence_text.bind("<KeyRelease>",
+                                lambda _: self._sync_to_mobile(debounce=True))
 
         # Suggestion strip — always packed, zero height when empty
         self.sugg_container = tk.Frame(self.root, bg=p["surface"])
@@ -876,6 +1150,7 @@ class App:
         sep = " " if current.rstrip() else ""
         self.sentence_text.insert("end", sep + phrase)
         self.phrase_history.append(phrase)
+        self._sync_to_mobile()
 
     def _undo(self):
         if not self.phrase_history:
@@ -883,6 +1158,7 @@ class App:
         self.phrase_history.pop()
         self.sentence_text.delete("1.0", "end")
         self.sentence_text.insert("1.0", " ".join(self.phrase_history))
+        self._sync_to_mobile()
 
     def _clear(self):
         self.sentence_text.delete("1.0", "end")
@@ -890,6 +1166,7 @@ class App:
         if self.sugg_container:
             for w in self.sugg_container.winfo_children():
                 w.destroy()
+        self._sync_to_mobile()
 
     # ── Edit mode ─────────────────────────────────────────────────────────────
 
@@ -1051,6 +1328,7 @@ class App:
         self.sentence_text.delete("1.0", "end")
         self.sentence_text.insert("1.0", improved)
         self.phrase_history.clear()
+        self._sync_to_mobile()
         self._restore_clean_btn()
         self.status_var.set("Sentence cleaned by Groq")
 
@@ -1064,6 +1342,55 @@ class App:
         self.clean_btn.config(text="Clean", font=("Segoe UI", fs + 8, "bold"),
                               bg=p["info_fg"], fg="#FFFFFF", state="normal", cursor="hand2")
         _hover(self.clean_btn, p["info_fg"], p["info_dk"], "#FFFFFF", "#FFFFFF")
+
+    # ── Mobile input ──────────────────────────────────────────────────────────
+
+    def _open_mobile(self):
+        if self._mobile_server is None:
+            try:
+                self._mobile_server = MobileServer(self)
+            except Exception as exc:
+                messagebox.showerror("Mobile server error", str(exc), parent=self.root)
+                return
+        ip  = _get_local_ip()
+        url = f"http://{ip}:{self._mobile_server.port}/"
+        if self._mobile_win is None or not self._mobile_win.winfo_exists():
+            self._mobile_win = MobileWindow(self.root, self, url)
+        else:
+            self._mobile_win.lift()
+            self._mobile_win.focus_force()
+
+    def _stop_mobile(self):
+        if self._mobile_server:
+            self._mobile_server.stop()
+            self._mobile_server = None
+        self._mobile_win = None
+
+    def _apply_mobile_text(self, text: str):
+        """Apply text received from the phone; guards against echo loops."""
+        current = self.sentence_text.get("1.0", "end-1c")
+        if current == text:
+            return
+        self._mobile_updating = True
+        self.sentence_text.delete("1.0", "end")
+        self.sentence_text.insert("1.0", text)
+        self._mobile_updating = False
+
+    def _sync_to_mobile(self, debounce: bool = False):
+        """Push the current sentence text to the mobile server."""
+        if not self._mobile_server or self._mobile_updating:
+            return
+        if debounce:
+            if self._mobile_sync_job:
+                self.root.after_cancel(self._mobile_sync_job)
+            self._mobile_sync_job = self.root.after(300, self._do_sync_to_mobile)
+        else:
+            self._do_sync_to_mobile()
+
+    def _do_sync_to_mobile(self):
+        self._mobile_sync_job = None
+        if self._mobile_server and not self._mobile_updating:
+            self._mobile_server.set_text(self.sentence_text.get("1.0", "end-1c"))
 
     # ── Settings ──────────────────────────────────────────────────────────────
 
@@ -1302,6 +1629,154 @@ class SettingsWindow(tk.Toplevel):
         save_json(SETTINGS_FILE, self.app.settings)
         self.app._rebuild_tabs()
         messagebox.showinfo("Saved", "Settings saved.", parent=self)
+
+
+# ── Mobile window (QR code popup) ────────────────────────────────────────────
+
+class MobileWindow(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, app: App, url: str):
+        super().__init__(parent)
+        self.app = app
+        p = app._p()
+
+        self.title("Mobile Input")
+        self.configure(bg=p["bg"])
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        hdr = tk.Frame(self, bg=p["hdr"], padx=16, pady=12)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Mobile Input",
+                 font=("Segoe UI", 13, "bold"),
+                 bg=p["hdr"], fg="#FFFFFF").pack(side="left")
+
+        inner = tk.Frame(self, bg=p["bg"], padx=28, pady=20)
+        inner.pack(fill="both", expand=True)
+
+        if QR_OK:
+            self._qr_canvas = tk.Canvas(inner, width=500, height=500,
+                                        bg="#FFFFFF", highlightthickness=0)
+            self._qr_canvas.pack(pady=(0, 14))
+            _draw_qr(self._qr_canvas, url, 500)
+        else:
+            self._qr_canvas = None
+            tk.Label(inner,
+                     text="Install qrcode to show a scannable code:\n"
+                          "pip install qrcode",
+                     font=("Segoe UI", 10),
+                     bg=p["bg"], fg=p["text3"],
+                     justify="center").pack(pady=(0, 8))
+
+        self._scan_lbl = tk.Label(inner, text="Scan with your phone's camera",
+                                  font=("Segoe UI", 13, "bold"),
+                                  bg=p["bg"], fg=p["text"])
+        self._scan_lbl.pack()
+
+        tk.Frame(inner, bg=p["border"], height=1).pack(fill="x", pady=(16, 6))
+
+        url_wrap = tk.Frame(inner, bg=p["border"], padx=1, pady=1)
+        url_wrap.pack(fill="x")
+        self._url_var = tk.StringVar(value=url)
+        tk.Entry(url_wrap, textvariable=self._url_var,
+                 font=("Segoe UI", 10), relief="flat", bd=0,
+                 state="readonly", readonlybackground=p["surface"],
+                 fg=p["text"]).pack(fill="x", padx=8, pady=6)
+
+        self._net_lbl = tk.Label(
+            inner, text="WiFi only — click Tunnel to use on any network",
+            font=("Segoe UI", 9), bg=p["bg"], fg=p["text3"])
+        self._net_lbl.pack(pady=(6, 0))
+
+        self._tunnel_btn = tk.Button(
+            inner,
+            text="  Tunnel  (works anywhere, free)",
+            font=("Segoe UI", 10),
+            command=self._start_tunnel,
+            bg=p["info_bg"], fg=p["info_fg"],
+            activebackground=p["info_hd"], activeforeground=p["info_fg"],
+            relief="flat", padx=14, pady=8, cursor="hand2",
+            highlightthickness=1, highlightbackground=p["info_fg"],
+        )
+        self._tunnel_btn.pack(pady=(12, 0), fill="x")
+        _hover(self._tunnel_btn, p["info_bg"], p["info_hd"], p["info_fg"])
+
+        close = tk.Button(inner, text="Close & stop server",
+                          font=("Segoe UI", 11),
+                          command=self._close,
+                          bg=p["btn_bg"], fg=p["text2"],
+                          activebackground=p["hover"], activeforeground=p["text"],
+                          relief="flat", padx=24, pady=10, cursor="hand2",
+                          highlightthickness=1, highlightbackground=p["border"])
+        close.pack(pady=(16, 0))
+        _hover(close, p["btn_bg"], p["hover"], p["text2"], p["text"])
+
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"+{px - self.winfo_width()//2}+{py - self.winfo_height()//2}")
+
+    def _update_url(self, url: str):
+        self._url_var.set(url)
+        if self._qr_canvas:
+            self._qr_canvas.delete("all")
+            _draw_qr(self._qr_canvas, url, 500)
+
+    def _start_tunnel(self):
+        p = self.app._p()
+        self._tunnel_btn.config(state="disabled", cursor="", text="Starting…")
+        self._tunnel_btn.unbind("<Enter>")
+        self._tunnel_btn.unbind("<Leave>")
+        port = self.app._mobile_server.port if self.app._mobile_server else 0
+
+        def _do():
+            if not _find_cloudflared():
+                self.after(0, lambda: self._tunnel_btn.config(
+                    text="Downloading cloudflared… 0%"))
+                try:
+                    _download_cloudflared(
+                        lambda pct: self.after(0, lambda v=pct:
+                            self._tunnel_btn.config(
+                                text=f"Downloading cloudflared… {v}%")))
+                except Exception as exc:
+                    self.after(0, lambda e=str(exc): self._on_tunnel_err(e))
+                    return
+            self.after(0, lambda: self._tunnel_btn.config(
+                text="Connecting to Cloudflare…"))
+            try:
+                proc = _launch_cf_tunnel(
+                    port,
+                    on_url=lambda u: self.after(0, lambda u=u: self._on_tunnel_url(u)),
+                    on_error=lambda e: self.after(0, lambda e=e: self._on_tunnel_err(e)),
+                )
+                if self.app._mobile_server:
+                    self.app._mobile_server._cf_proc = proc
+            except Exception as exc:
+                self.after(0, lambda e=str(exc): self._on_tunnel_err(e))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_tunnel_url(self, url: str):
+        p = self.app._p()
+        self._tunnel_btn.config(
+            text="Tunnel active", state="disabled", cursor="",
+            bg=p["green_l"], fg=p["green"],
+            highlightbackground=p["green"])
+        self._net_lbl.config(text="Tunnel active — works on any network")
+        self._scan_lbl.config(text="Scan with your phone's camera")
+        self._update_url(url)
+
+    def _on_tunnel_err(self, msg: str):
+        p = self.app._p()
+        self._tunnel_btn.config(
+            text=f"Error — {msg[:55]}",
+            state="normal", cursor="hand2",
+            bg=p["danger_bg"], fg=p["danger_fg"],
+            highlightbackground=p["danger_fg"])
+        _hover(self._tunnel_btn, p["danger_bg"], p["danger_hd"], p["danger_fg"])
+
+    def _close(self):
+        self.app._stop_mobile()
+        self.destroy()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
