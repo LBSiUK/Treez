@@ -206,7 +206,7 @@ CAT_COLORS = [
 GROK_BASE_URL = "https://api.groq.com/openai/v1"
 GROK_MODEL    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-APP_VERSION  = "1.1.0"
+APP_VERSION  = "2.0.0"
 GITHUB_OWNER = "011-sam-110"
 GITHUB_REPO  = "Treez"
 
@@ -429,25 +429,42 @@ def _download_cloudflared(on_progress) -> str:
     return _CF_EXE
 
 
+_CF_TIMEOUT = 90  # seconds to wait for tunnel URL before giving up
+
+
 def _launch_cf_tunnel(port: int, on_url, on_error) -> "subprocess.Popen":
-    import subprocess
-    cf   = _find_cloudflared()
+    import subprocess, time
+    cf = _find_cloudflared()
+    log.info("Launching cloudflared tunnel on port %d  (exe: %s)", port, cf)
     proc = subprocess.Popen(
         [cf, "--no-autoupdate", "tunnel", "--url", f"http://localhost:{port}"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
+    log.info("cloudflared PID %d started", proc.pid)
 
     def _read():
+        deadline = time.monotonic() + _CF_TIMEOUT
         try:
             for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log.info("[cloudflared] %s", line)
                 m = _CF_URL_RE.search(line)
                 if m:
+                    log.info("Tunnel URL obtained: %s", m.group())
                     on_url(m.group())
                     return
+                if time.monotonic() > deadline:
+                    log.error("Tunnel timed out after %ds without a URL", _CF_TIMEOUT)
+                    proc.kill()
+                    on_error(f"Timed out after {_CF_TIMEOUT}s — no URL received")
+                    return
+            log.warning("cloudflared stdout closed without a URL")
             on_error("Tunnel closed without providing a URL")
         except Exception as exc:
+            log.error("Tunnel read error: %s", exc)
             on_error(str(exc))
 
     threading.Thread(target=_read, daemon=True).start()
@@ -539,11 +556,11 @@ class MobileServer:
             self._text    = text
             self._version += 1
             v = self._version
-        QTimer.singleShot(0, lambda t=text: self.win._apply_mobile_text(t))
+        QTimer.singleShot(0, self.win, lambda t=text: self.win._apply_mobile_text(t))
         return v
 
     def phone_go(self):
-        QTimer.singleShot(0, self.win._go)
+        QTimer.singleShot(0, self.win, self.win._go)
 
 
 # ── Qt stylesheet builder ──────────────────────────────────────────────────────
@@ -597,18 +614,18 @@ class PhraseButton(QLabel):
         self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.setCursor(Qt.PointingHandCursor)
         weight = "bold" if bold else "normal"
-        pad    = "12px 16px"
+        pad    = "16px 20px"
         self._ss_normal  = (f"background:{bg};color:{fg};padding:{pad};"
-                            f"border:1px solid {fg};font-size:{font_size}px;"
+                            f"border:1px solid {bg};font-size:{font_size}px;"
                             f"font-weight:{weight};font-family:'Segoe UI';")
         self._ss_hover   = (f"background:{hover_bg};color:{hover_fg};padding:{pad};"
-                            f"border:1px solid {fg};font-size:{font_size}px;"
+                            f"border:1px solid {bg};font-size:{font_size}px;"
                             f"font-weight:{weight};font-family:'Segoe UI';")
         self._ss_pressed = (f"background:{hover_fg};color:{hover_bg};padding:{pad};"
-                            f"border:1px solid {fg};font-size:{font_size}px;"
+                            f"border:1px solid {bg};font-size:{font_size}px;"
                             f"font-weight:{weight};font-family:'Segoe UI';")
         self.setStyleSheet(self._ss_normal)
-        self.setMinimumHeight(64)
+        self.setMinimumHeight(72)
 
     def enterEvent(self, _e):
         self.setStyleSheet(self._ss_hover)
@@ -712,9 +729,10 @@ class MainWindow(QMainWindow):
         saved = ""
         if hasattr(self, "sentence_text"):
             saved = self.sentence_text.toPlainText()
-        self._tab_widgets  = {}
-        self._active_tab   = None
+        self._tab_widgets   = {}
+        self._active_tab    = None
         self.sugg_container = None
+        self._sugg_expanded = False
         old = self.centralWidget()
         self._build_ui()
         if old:
@@ -795,7 +813,7 @@ class MainWindow(QMainWindow):
         self.sentence_text.setObjectName("sentence")
         self.sentence_text.setMaximumHeight(90)
         self.sentence_text.setMinimumHeight(70)
-        font = QFont("Segoe UI", 11)
+        font = QFont("Segoe UI", 16)
         font.setBold(dark)
         self.sentence_text.setFont(font)
         self.sentence_text.textChanged.connect(
@@ -805,6 +823,21 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(sent_panel)
 
         # ── Suggestion strip ────────────────────────────────────────────────
+        self._sugg_expanded = False
+
+        self.sugg_header = QPushButton()
+        self.sugg_header.setCursor(Qt.PointingHandCursor)
+        self.sugg_header.setStyleSheet(
+            f"QPushButton {{ background:{p['surface']}; color:{p['text3']}; "
+            f"border:none; border-bottom:1px solid {p['border']}; "
+            f"padding:4px 12px; font-family:'Segoe UI'; font-size:9px; "
+            f"text-align:left; }}"
+            f"QPushButton:hover {{ background:{p['hover']}; }}"
+        )
+        self.sugg_header.clicked.connect(self._toggle_suggestions)
+        self.sugg_header.hide()
+        root_layout.addWidget(self.sugg_header)
+
         self.sugg_container = QWidget()
         self.sugg_container.setStyleSheet(f"background:{p['surface']};")
         self.sugg_layout = QHBoxLayout(self.sugg_container)
@@ -869,6 +902,13 @@ class MainWindow(QMainWindow):
         sb = self.statusBar()
         sb.setStyleSheet(f"background:{p['surface']};color:{p['text3']};font-size:10px;")
 
+        # Remove stale widgets from previous builds (statusBar() persists across rebuilds)
+        for attr in ("_wifi_label", "_status_label"):
+            old_w = getattr(self, attr, None)
+            if old_w is not None:
+                sb.removeWidget(old_w)
+                old_w.deleteLater()
+
         self._wifi_label = QLabel("  ")
         self._wifi_label.setStyleSheet(f"background:{p['surface']};font-size:14px;")
         sb.addWidget(self._wifi_label)
@@ -913,7 +953,7 @@ class MainWindow(QMainWindow):
     def _poll_wifi(self):
         def check():
             online = _is_online()
-            QTimer.singleShot(0, lambda: self._apply_wifi(online))
+            QTimer.singleShot(0, self, lambda o=online: self._apply_wifi(o))
         threading.Thread(target=check, daemon=True).start()
 
     def _apply_wifi(self, online: bool):
@@ -977,7 +1017,7 @@ class MainWindow(QMainWindow):
         self._tab_widgets = {}
         self._active_tab  = None
         p  = self._p()
-        fs = self.settings.get("font_size", 14)
+        fs = self.settings.get("font_size", 14) + 4
 
         for cat_idx, cat in enumerate(self.phrases_data.get("categories", [])):
             name           = cat["name"]
@@ -999,9 +1039,9 @@ class MainWindow(QMainWindow):
             tab_btn = QPushButton(f"  {name}  ")
             tab_btn.setCursor(Qt.PointingHandCursor)
             tab_btn.setStyleSheet(
-                f"QPushButton {{ background:{p['surface']}; color:{p['text2']}; "
-                f"border:none; padding:11px 0; font-family:'Segoe UI'; font-size:11px; }}"
-                f"QPushButton:hover {{ background:{cat_bg}; color:{cat_fg}; }}"
+                f"QPushButton {{ background:{cat_bg}; color:{cat_fg}; "
+                f"border:none; padding:11px 0; font-family:'Segoe UI'; font-size:14px; }}"
+                f"QPushButton:hover {{ background:{cat_fg}; color:#FFFFFF; font-weight:bold; }}"
             )
             tab_btn.clicked.connect(lambda checked=False, n=name: self._select_tab(n))
             br_layout.addWidget(tab_btn)
@@ -1117,8 +1157,8 @@ class MainWindow(QMainWindow):
                 count = self.usage.get(f"{cat_name}|{phrase}", 0)
                 label = phrase + (f"  [{count}]" if count > 0 else "")
                 btn = PhraseButton(
-                    label, cat_bg, cat_fg, p["hover"], p["text"],
-                    font_size=fs, bold=(p["weight"] == "bold"),
+                    label, cat_fg, "#FFFFFF", p["hover"], p["text"],
+                    font_size=fs, bold=True,
                 )
                 btn.clicked.connect(
                     lambda ph=phrase, ci=cat_idx: self._add_phrase_tracked(ph, ci))
@@ -1179,7 +1219,7 @@ class MainWindow(QMainWindow):
         try:
             tag, exe_url = _fetch_latest_release()
             if tag and exe_url and _version_newer(tag, APP_VERSION):
-                QTimer.singleShot(0, lambda: self._show_update_banner(tag, exe_url))
+                QTimer.singleShot(0, self, lambda t=tag, u=exe_url: self._show_update_banner(t, u))
         except Exception:
             pass
 
@@ -1223,18 +1263,18 @@ class MainWindow(QMainWindow):
         if self._active_tab and self._active_tab in self._tab_widgets:
             prev = self._tab_widgets[self._active_tab]
             prev["btn"].setStyleSheet(
-                f"QPushButton {{ background:{p['surface']}; color:{p['text2']}; "
-                f"border:none; padding:11px 0; font-family:'Segoe UI'; font-size:11px; }}"
-                f"QPushButton:hover {{ background:{prev['cat_bg']}; color:{prev['cat_fg']}; }}"
+                f"QPushButton {{ background:{prev['cat_bg']}; color:{prev['cat_fg']}; "
+                f"border:none; padding:11px 0; font-family:'Segoe UI'; font-size:14px; }}"
+                f"QPushButton:hover {{ background:{prev['cat_fg']}; color:#FFFFFF; font-weight:bold; }}"
             )
             prev["indicator"].setStyleSheet(f"background:{p['surface']};border:none;")
 
         self._active_tab = name
         cur = self._tab_widgets[name]
         cur["btn"].setStyleSheet(
-            f"QPushButton {{ background:{p['bg']}; color:{cur['cat_fg']}; "
+            f"QPushButton {{ background:{cur['cat_fg']}; color:#FFFFFF; "
             f"border:none; padding:11px 0; font-family:'Segoe UI'; "
-            f"font-size:11px; font-weight:bold; }}"
+            f"font-size:14px; font-weight:bold; }}"
         )
         cur["indicator"].setStyleSheet(
             f"background:{cur['cat_fg']};border:none;")
@@ -1249,6 +1289,17 @@ class MainWindow(QMainWindow):
         self.usage[key] = self.usage.get(key, 0) + 1
         save_json(USAGE_FILE, self.usage)
         self._update_suggestions(cat_idx)
+
+    def _toggle_suggestions(self):
+        self._sugg_expanded = not self._sugg_expanded
+        self.sugg_container.setVisible(self._sugg_expanded)
+        self._refresh_sugg_header()
+
+    def _refresh_sugg_header(self):
+        p     = self._p()
+        count = self.sugg_layout.count() - 1  # exclude stretch
+        arrow = "▼" if self._sugg_expanded else "▶"
+        self.sugg_header.setText(f"  {arrow}  Suggestions  ({count})")
 
     def _update_suggestions(self, from_cat_idx: int):
         p      = self._p()
@@ -1273,13 +1324,9 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
 
         if not top:
+            self.sugg_header.hide()
             self.sugg_container.hide()
             return
-
-        lbl = QLabel("Suggest:")
-        lbl.setStyleSheet(f"color:{p['text3']};font-size:9px;"
-                          f"background:{p['surface']};font-family:'Segoe UI';")
-        self.sugg_layout.addWidget(lbl)
 
         for _cnt, ci, ph in top:
             cbg, cfg = self._cat_color(ci)
@@ -1290,7 +1337,10 @@ class MainWindow(QMainWindow):
             self.sugg_layout.addWidget(b)
 
         self.sugg_layout.addStretch()
-        self.sugg_container.show()
+        self._refresh_sugg_header()
+        self.sugg_header.show()
+        # body stays at its current expanded/collapsed state
+        self.sugg_container.setVisible(self._sugg_expanded)
 
     # ── Sentence actions ───────────────────────────────────────────────────────
 
@@ -1318,7 +1368,9 @@ class MainWindow(QMainWindow):
             item = self.sugg_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self.sugg_header.hide()
         self.sugg_container.hide()
+        self._sugg_expanded = False
         self._sync_to_mobile()
 
     # ── Edit mode ──────────────────────────────────────────────────────────────
@@ -1478,11 +1530,11 @@ class MainWindow(QMainWindow):
                 ],
             )
             improved = response.choices[0].message.content.strip()
-            QTimer.singleShot(0, lambda: self._apply_clean(improved))
+            QTimer.singleShot(0, self, lambda i=improved: self._apply_clean(i))
         except Exception as exc:
             log.exception("Clean API call failed")
             msg = str(exc)
-            QTimer.singleShot(0, lambda: self._clean_error(msg))
+            QTimer.singleShot(0, self, lambda m=msg: self._clean_error(m))
 
     def _apply_clean(self, improved: str):
         self.sentence_text.setPlainText(improved)
@@ -1519,12 +1571,11 @@ class MainWindow(QMainWindow):
                 return
         ip  = _get_local_ip()
         url = f"http://{ip}:{self._mobile_server.port}/"
-        if self._mobile_win is None or not self._mobile_win.isVisible():
+        if self._mobile_win is None:
             self._mobile_win = MobileWindow(self, url)
-            self._mobile_win.show()
-        else:
-            self._mobile_win.raise_()
-            self._mobile_win.activateWindow()
+        self._mobile_win.show()
+        self._mobile_win.raise_()
+        self._mobile_win.activateWindow()
 
     def _stop_mobile(self):
         if self._mobile_server:
@@ -1872,8 +1923,6 @@ class MobileWindow(QDialog):
         self.setWindowTitle("Mobile Input")
         self.setStyleSheet(_qss(p) + f"QDialog {{ background:{p['bg']}; }}")
         self.setFixedWidth(560)
-        self.setAttribute(Qt.WA_DeleteOnClose)
-        self.finished.connect(self._on_close)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1951,7 +2000,7 @@ class MobileWindow(QDialog):
         il.addWidget(self._tunnel_btn)
         il.addSpacing(16)
 
-        close_btn = QPushButton("Close & stop server")
+        close_btn = QPushButton("I'm connected / close")
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setStyleSheet(
             f"QPushButton {{ background:{p['btn_bg']}; color:{p['text2']}; "
@@ -1959,7 +2008,7 @@ class MobileWindow(QDialog):
             f"font-family:'Segoe UI'; font-size:11px; }}"
             f"QPushButton:hover {{ background:{p['hover']}; }}"
         )
-        close_btn.clicked.connect(self.close)
+        close_btn.clicked.connect(self.hide)
         il.addWidget(close_btn, 0, Qt.AlignCenter)
 
     def _refresh_qr(self, url: str):
@@ -1984,36 +2033,44 @@ class MobileWindow(QDialog):
         self._tunnel_btn.setEnabled(False)
         self._tunnel_btn.setText("Starting…")
         port = self.app._mobile_server.port if self.app._mobile_server else 0
+        log.info("Tunnel requested on port %d", port)
+
+        def _gui(fn):
+            """Post fn() to the GUI thread via self's event loop."""
+            QTimer.singleShot(0, self, fn)
 
         def _do():
             if not _find_cloudflared():
-                QTimer.singleShot(0, lambda: self._tunnel_btn.setText(
-                    "Downloading cloudflared… 0%"))
+                log.info("cloudflared not found — downloading")
+                _gui(lambda: self._tunnel_btn.setText("Downloading cloudflared… 0%"))
                 try:
                     _download_cloudflared(
-                        lambda pct: QTimer.singleShot(0, lambda v=pct:
-                            self._tunnel_btn.setText(
-                                f"Downloading cloudflared… {v}%")))
+                        lambda pct: _gui(lambda v=pct:
+                            self._tunnel_btn.setText(f"Downloading cloudflared… {v}%")))
                 except Exception as exc:
-                    QTimer.singleShot(0, lambda e=str(exc): self._on_tunnel_err(e))
+                    log.error("cloudflared download failed: %s", exc)
+                    _gui(lambda e=str(exc): self._on_tunnel_err(e))
                     return
-            QTimer.singleShot(0, lambda: self._tunnel_btn.setText(
-                "Connecting to Cloudflare…"))
+            else:
+                log.info("cloudflared found at %s", _find_cloudflared())
+            _gui(lambda: self._tunnel_btn.setText("Connecting to Cloudflare…"))
             try:
                 proc = _launch_cf_tunnel(
                     port,
-                    on_url=lambda u: QTimer.singleShot(0, lambda u=u: self._on_tunnel_url(u)),
-                    on_error=lambda e: QTimer.singleShot(0, lambda e=e: self._on_tunnel_err(e)),
+                    on_url=lambda u: _gui(lambda u=u: self._on_tunnel_url(u)),
+                    on_error=lambda e: _gui(lambda e=e: self._on_tunnel_err(e)),
                 )
                 if self.app._mobile_server:
                     self.app._mobile_server._cf_proc = proc
             except Exception as exc:
-                QTimer.singleShot(0, lambda e=str(exc): self._on_tunnel_err(e))
+                log.error("_launch_cf_tunnel raised: %s", exc)
+                _gui(lambda e=str(exc): self._on_tunnel_err(e))
 
         threading.Thread(target=_do, daemon=True).start()
 
     def _on_tunnel_url(self, url: str):
         p = self.app._p()
+        log.info("Tunnel active: %s", url)
         self._tunnel_btn.setText("Tunnel active")
         self._tunnel_btn.setStyleSheet(
             f"QPushButton {{ background:{p['green_l']}; color:{p['green']}; "
@@ -2024,6 +2081,7 @@ class MobileWindow(QDialog):
         self._update_url(url)
 
     def _on_tunnel_err(self, msg: str):
+        log.error("Tunnel error: %s", msg)
         p = self.app._p()
         self._tunnel_btn.setEnabled(True)
         self._tunnel_btn.setCursor(Qt.PointingHandCursor)
@@ -2035,8 +2093,9 @@ class MobileWindow(QDialog):
             f"QPushButton:hover {{ background:{p['danger_hd']}; }}"
         )
 
-    def _on_close(self):
-        self.app._stop_mobile()
+    def closeEvent(self, event):
+        self.hide()
+        event.ignore()
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
