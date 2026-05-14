@@ -8,3 +8,10 @@ settings.json
 api_keys.py
 .env
 .env.*
+
+# C# build artifacts
+App/bin/
+App/obj/
+
+# Misc
+runcommands.txt
