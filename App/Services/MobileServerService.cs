@@ -21,10 +21,33 @@ public class MobileServerService : IDisposable
 
     public MobileServerService()
     {
-        Port = FindFreePort();
-        _listener.Prefixes.Add($"http://*:{Port}/");
-        _listener.Start();
+        Port = 8765;
+        _listener.Prefixes.Add($"http://+:{Port}/");
+        StartListener();
         Task.Run(ServeLoop, _cts.Token);
+    }
+
+    private void StartListener()
+    {
+        try
+        {
+            _listener.Start();
+        }
+        catch (System.Net.HttpListenerException ex) when (ex.ErrorCode == 5)
+        {
+            // Access denied — register the URL ACL once (one-time UAC prompt)
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = $"http add urlacl url=http://+:{Port}/ user=Everyone",
+                Verb = "runas",
+                UseShellExecute = true,
+                CreateNoWindow = true,
+            };
+            var proc = System.Diagnostics.Process.Start(psi);
+            proc?.WaitForExit();
+            _listener.Start();
+        }
     }
 
     public void UpdateText(string text)
@@ -111,14 +134,6 @@ public class MobileServerService : IDisposable
         _listener.Close();
     }
 
-    private static int FindFreePort()
-    {
-        var l = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        int port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
-    }
 
     private const string MobileHtml = """
         <!DOCTYPE html>

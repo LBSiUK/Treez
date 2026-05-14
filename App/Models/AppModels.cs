@@ -45,6 +45,9 @@ public class AppSettings
 
     [JsonPropertyName("groq_api_key")]
     public string GroqApiKey { get; set; } = "";
+
+    [JsonPropertyName("tos_accepted")]
+    public bool TosAccepted { get; set; } = false;
 }
 
 // Each (category|phrase) pair maps to its usage count

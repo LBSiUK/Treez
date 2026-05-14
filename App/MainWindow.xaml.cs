@@ -5,9 +5,12 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Imaging;
+using QRCoder;
 using SurveySentenceGenerator.Models;
 using SurveySentenceGenerator.Services;
 using Windows.ApplicationModel.DataTransfer;
+using Windows.Storage.Streams;
 using Windows.UI;
 
 namespace SurveySentenceGenerator;
@@ -64,6 +67,7 @@ public sealed partial class MainWindow : Window
     private readonly List<string> _history = new();
     private readonly GroqService  _groq    = new();
     private MobileServerService?  _mobile;
+    private TunnelService?        _tunnel;
 
     // ── Named UI controls ────────────────────────────────────────────────────
     private Grid         _appTitleBar   = null!;
@@ -112,7 +116,8 @@ public sealed partial class MainWindow : Window
         _settings = DataService.LoadSettings();
         _usage    = DataService.LoadUsage();
 
-        Content = BuildUi();
+        var ui = (FrameworkElement)BuildUi();
+        Content = ui;
 
         SetupWindow();
         TrySetMicaBackdrop();
@@ -121,6 +126,9 @@ public sealed partial class MainWindow : Window
         _statusText.Text = $"Ready  |  v{AppVersion}";
         _versionText.Text = $"v{AppVersion}";
         _ = Task.Run(CheckForUpdateAsync);
+
+        if (!_settings.TosAccepted)
+            ui.Loaded += async (_, _) => await RunFirstTimeSetupAsync();
     }
 
     // ── Root UI ───────────────────────────────────────────────────────────────
@@ -426,17 +434,32 @@ public sealed partial class MainWindow : Window
         _wifiIcon = new FontIcon { Glyph = "", FontSize = 13, Foreground = new SolidColorBrush(ParseColor("#059669")) };
         _statusText = new TextBlock { FontSize = 12, Foreground = new SolidColorBrush(ParseColor("#475569")), VerticalAlignment = VerticalAlignment.Center };
 
-        var inner = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Spacing = 8 };
-        inner.Children.Add(_wifiIcon);
-        inner.Children.Add(_statusText);
+        var left = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Spacing = 8 };
+        left.Children.Add(_wifiIcon);
+        left.Children.Add(_statusText);
 
-        return new Grid
+        var copyright = new TextBlock
+        {
+            Text = "© 2026 Survey Sentence Generator",
+            FontSize = 12,
+            Foreground = new SolidColorBrush(ParseColor("#94A3B8")),
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+
+        var bar = new Grid
         {
             Background = new SolidColorBrush(ParseColor("#E2E8F0")),
             Height = 30,
             Padding = new Thickness(12, 0, 12, 0),
-            Children = { inner },
         };
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(left, 0);
+        Grid.SetColumn(copyright, 1);
+        bar.Children.Add(left);
+        bar.Children.Add(copyright);
+        return bar;
     }
 
     // ── Window setup ──────────────────────────────────────────────────────────
@@ -464,8 +487,8 @@ public sealed partial class MainWindow : Window
             _btnPanel.Margin = new Thickness(0, 0, AppWindow.TitleBar.RightInset / scale, 0);
         };
 
-        AppWindow.Resize(new Windows.Graphics.SizeInt32(
-            (int)_settings.WindowWidth, (int)_settings.WindowHeight));
+        if (AppWindow.Presenter is OverlappedPresenter overlapped)
+            overlapped.Maximize();
 
         AppWindow.Closing += (_, _) =>
         {
@@ -473,6 +496,8 @@ public sealed partial class MainWindow : Window
             _settings.WindowHeight = AppWindow.Size.Height;
             DataService.SaveSettings(_settings);
             DataService.SaveUsage(_usage);
+            _tunnel?.Dispose();
+            _mobile?.Dispose();
         };
     }
 
@@ -984,25 +1009,156 @@ public sealed partial class MainWindow : Window
                 _mobile.TextChanged += text => DispatcherQueue.TryEnqueue(() => _sentenceBox.Text = text);
                 _mobile.GoTriggered += () => DispatcherQueue.TryEnqueue(() => GoBtn_Click(this, new RoutedEventArgs()));
             }
-            catch (Exception ex)
-            {
-                await ShowSimpleDialog("Mobile Server Error", ex.Message);
-                return;
-            }
+            catch (Exception ex) { await ShowSimpleDialog("Mobile Server Error", ex.Message); return; }
         }
 
-        var url = $"http://{GetLocalIp()}:{_mobile.Port}/";
-        var urlBlock = new TextBlock { Text = url, FontSize = 14, IsTextSelectionEnabled = true };
-        var note = new TextBlock { Text = "Open on your phone while on the same WiFi network.", FontSize = 13, Foreground = new SolidColorBrush(ParseColor("#64748B")), TextWrapping = TextWrapping.Wrap, MaxWidth = 340 };
-        var panel = new StackPanel { Spacing = 12, HorizontalAlignment = HorizontalAlignment.Center };
-        panel.Children.Add(urlBlock);
-        panel.Children.Add(note);
+        var localUrl = $"http://{GetLocalIp()}:{_mobile.Port}/";
+        var root = new StackPanel { Spacing = 14, Width = 340 };
+
+        // ── Local WiFi ────────────────────────────────────────────────────────
+        root.Children.Add(MobileLabel("LOCAL WIFI"));
+        root.Children.Add(new TextBlock { Text = localUrl, FontSize = 14, IsTextSelectionEnabled = true, TextWrapping = TextWrapping.Wrap });
+        root.Children.Add(new TextBlock { Text = "Same network as the Toughbook.", FontSize = 12, Foreground = new SolidColorBrush(ParseColor("#64748B")) });
+
+        var localQrSlot = new Border { HorizontalAlignment = HorizontalAlignment.Center };
+        root.Children.Add(localQrSlot);
+        _ = GenerateQrImageAsync(localUrl).ContinueWith(
+            t => DispatcherQueue.TryEnqueue(() => localQrSlot.Child = t.Result),
+            TaskScheduler.Default);
+
+        // ── Divider ───────────────────────────────────────────────────────────
+        root.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(ParseColor("#CBD5E1")), Margin = new Thickness(0, 4, 0, 4) });
+
+        // ── Cloudflare Tunnel ─────────────────────────────────────────────────
+        root.Children.Add(MobileLabel("CLOUDFLARE TUNNEL"));
+        root.Children.Add(new TextBlock { Text = "Access from any network — no WiFi required.", FontSize = 12, Foreground = new SolidColorBrush(ParseColor("#64748B")), TextWrapping = TextWrapping.Wrap });
+
+        var tunnelContainer = new StackPanel { Spacing = 10 };
+        root.Children.Add(tunnelContainer);
+
+        if (_tunnel?.TunnelUrl is string existingUrl)
+            ShowTunnelActive(tunnelContainer, existingUrl);
+        else
+            ShowTunnelStopped(tunnelContainer);
 
         await new ContentDialog
         {
-            Title = "Mobile Input", Content = panel,
-            CloseButtonText = "Close", XamlRoot = Content.XamlRoot,
+            Title = "Mobile Input",
+            Content = new ScrollViewer { Content = root, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, MaxHeight = 600 },
+            CloseButtonText = "Close",
+            XamlRoot = Content.XamlRoot,
         }.ShowAsync();
+    }
+
+    private void ShowTunnelStopped(StackPanel container)
+    {
+        container.Children.Clear();
+        var btn = new Button
+        {
+            Content = "Start Cloudflare Tunnel",
+            Height = 44, HorizontalAlignment = HorizontalAlignment.Stretch,
+            Background = new SolidColorBrush(ParseColor("#F97316")),
+            Foreground = new SolidColorBrush(Colors.White),
+            BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(6),
+            FontWeight = FontWeights.SemiBold, FontSize = 15,
+        };
+        btn.Click += async (_, _) => await StartTunnelAsync(container);
+        container.Children.Add(btn);
+    }
+
+    private void ShowTunnelActive(StackPanel container, string url)
+    {
+        container.Children.Clear();
+        container.Children.Add(new TextBlock
+        {
+            Text = url, FontSize = 13, IsTextSelectionEnabled = true,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = new SolidColorBrush(ParseColor("#059669")),
+        });
+
+        var qrSlot = new Border { HorizontalAlignment = HorizontalAlignment.Center };
+        container.Children.Add(qrSlot);
+        _ = GenerateQrImageAsync(url).ContinueWith(
+            t => DispatcherQueue.TryEnqueue(() => qrSlot.Child = t.Result),
+            TaskScheduler.Default);
+
+        var stopBtn = new Button
+        {
+            Content = "Stop Tunnel", Height = 40,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            CornerRadius = new CornerRadius(6), FontWeight = FontWeights.SemiBold,
+        };
+        stopBtn.Click += (_, _) =>
+        {
+            _tunnel?.Dispose();
+            _tunnel = null;
+            ShowTunnelStopped(container);
+        };
+        container.Children.Add(stopBtn);
+    }
+
+    private async Task StartTunnelAsync(StackPanel container)
+    {
+        container.Children.Clear();
+        var status = new TextBlock { FontSize = 13, Foreground = new SolidColorBrush(ParseColor("#64748B")), TextWrapping = TextWrapping.Wrap };
+        container.Children.Add(status);
+
+        try
+        {
+            _tunnel ??= new TunnelService(_mobile!.Port);
+
+            status.Text = File.Exists(TunnelService.ExePath)
+                ? "Starting tunnel…"
+                : "Downloading cloudflared (one-time, ~30 MB)…";
+
+            await _tunnel.EnsureDownloadedAsync();
+            status.Text = "Waiting for tunnel URL…";
+
+            var tcs = new TaskCompletionSource<string>();
+            _tunnel.UrlReady += url => tcs.TrySetResult(url);
+            _tunnel.Start();
+
+            var tunnelUrl = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            ShowTunnelActive(container, tunnelUrl);
+        }
+        catch (TimeoutException)
+        {
+            status.Text = "Timed out waiting for tunnel URL.";
+            var retry = new Button { Content = "Retry", Margin = new Thickness(0, 6, 0, 0) };
+            retry.Click += async (_, _) => await StartTunnelAsync(container);
+            container.Children.Add(retry);
+        }
+        catch (Exception ex)
+        {
+            status.Text = $"Error: {ex.Message[..Math.Min(80, ex.Message.Length)]}";
+        }
+    }
+
+    private static TextBlock MobileLabel(string text) => new()
+    {
+        Text = text, FontSize = 11, FontWeight = FontWeights.SemiBold,
+        Foreground = new SolidColorBrush(ParseColor("#64748B")),
+        CharacterSpacing = 80,
+    };
+
+    private static async Task<Image> GenerateQrImageAsync(string url)
+    {
+        var pngBytes = await Task.Run(() =>
+        {
+            using var gen = new QRCodeGenerator();
+            var data = gen.CreateQrCode(url, QRCodeGenerator.ECCLevel.M);
+            return new PngByteQRCode(data).GetGraphic(8);
+        });
+
+        var stream = new InMemoryRandomAccessStream();
+        var writer = new DataWriter(stream);
+        writer.WriteBytes(pngBytes);
+        await writer.StoreAsync();
+        stream.Seek(0);
+
+        var bitmap = new BitmapImage();
+        await bitmap.SetSourceAsync(stream);
+        return new Image { Source = bitmap, Width = 200, Height = 200 };
     }
 
     // ── Auto-update ────────────────────────────────────────────────────────────
@@ -1036,6 +1192,137 @@ public sealed partial class MainWindow : Window
             Application.Current.Exit();
         }
     }
+
+    // ── First-run setup ───────────────────────────────────────────────────────
+    private async Task RunFirstTimeSetupAsync()
+    {
+        if (!await ShowTosAsync())
+        {
+            Application.Current.Exit();
+            return;
+        }
+        _settings.TosAccepted = true;
+        DataService.SaveSettings(_settings);
+
+        await ShowCloudflaredSetupAsync();
+    }
+
+    private async Task<bool> ShowTosAsync()
+    {
+        var text = new TextBlock
+        {
+            Text = TosText, TextWrapping = TextWrapping.Wrap,
+            FontSize = 13, LineHeight = 22,
+        };
+        var scroll = new ScrollViewer
+        {
+            Content = text, MaxHeight = 420, MaxWidth = 480,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+        };
+        var dlg = new ContentDialog
+        {
+            Title = "Terms of Use — Please Read",
+            Content = scroll,
+            PrimaryButtonText = "I Agree",
+            CloseButtonText = "Decline",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot,
+        };
+        return await dlg.ShowAsync() == ContentDialogResult.Primary;
+    }
+
+    private async Task ShowCloudflaredSetupAsync()
+    {
+        if (File.Exists(TunnelService.ExePath)) return;
+
+        var choiceDlg = new ContentDialog
+        {
+            Title = "Mobile Feature Setup",
+            Content = new TextBlock
+            {
+                Text = "The Mobile Input feature uses Cloudflare Tunnel (cloudflared) to let " +
+                       "your phone connect from any network — not just the Toughbook's WiFi.\n\n" +
+                       "Would you like to download cloudflared now? (~30 MB, one-time only)",
+                TextWrapping = TextWrapping.Wrap, FontSize = 14, LineHeight = 22, MaxWidth = 400,
+            },
+            PrimaryButtonText = "Download Now",
+            CloseButtonText = "Skip for Now",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot,
+        };
+
+        if (await choiceDlg.ShowAsync() != ContentDialogResult.Primary) return;
+
+        var status = new TextBlock { Text = "Downloading cloudflared…", FontSize = 14, TextWrapping = TextWrapping.Wrap };
+        var bar    = new ProgressBar { IsIndeterminate = true, Margin = new Thickness(0, 10, 0, 0) };
+        var inner  = new StackPanel { Width = 400, Children = { status, bar } };
+
+        var dlg = new ContentDialog
+        {
+            Title = "Setting Up Mobile Feature",
+            Content = inner,
+            CloseButtonText = "Cancel",
+            XamlRoot = Content.XamlRoot,
+        };
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await new TunnelService(0).EnsureDownloadedAsync();
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    status.Text = "Cloudflared is ready. Mobile tunnels will work instantly.";
+                    bar.IsIndeterminate = false;
+                    bar.Value = 100;
+                });
+                await Task.Delay(1500);
+                DispatcherQueue.TryEnqueue(dlg.Hide);
+            }
+            catch (Exception ex)
+            {
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    status.Text = $"Download failed: {ex.Message[..Math.Min(70, ex.Message.Length)]}\n\nYou can retry via the Mobile button later.";
+                    bar.Visibility = Visibility.Collapsed;
+                });
+            }
+        });
+
+        await dlg.ShowAsync();
+    }
+
+    private const string TosText =
+        "SURVEY SENTENCE GENERATOR — TERMS OF USE\n\n" +
+
+        "1. ACCEPTABLE USE\n" +
+        "This application is provided for professional survey and field data collection. " +
+        "You agree to use it only for lawful purposes and in accordance with your organisation's policies.\n\n" +
+
+        "2. LOCAL DATA\n" +
+        "All phrase data and settings are stored locally on this device. No data is sent to external " +
+        "servers except when using the optional Groq AI or Cloudflare Tunnel features, which require " +
+        "an internet connection.\n\n" +
+
+        "3. CLOUDFLARE TUNNEL (OPTIONAL)\n" +
+        "The Mobile Input feature optionally downloads and runs cloudflared, a third-party binary " +
+        "published by Cloudflare, Inc. Use is subject to Cloudflare's Terms of Service " +
+        "(cloudflare.com/terms). The binary is sourced from Cloudflare's official GitHub releases.\n\n" +
+
+        "4. GROQ AI (OPTIONAL)\n" +
+        "The Clean feature sends your sentence to the Groq API for rephrasing. You must supply " +
+        "your own API key. Use is subject to Groq's Terms of Service. Your key is stored only on " +
+        "this device.\n\n" +
+
+        "5. AUTO-UPDATE\n" +
+        "Updates are downloaded from the official GitHub releases page. By accepting an update you " +
+        "acknowledge that application files will be replaced.\n\n" +
+
+        "6. NO WARRANTY\n" +
+        "This application is provided \"as is\" without warranty of any kind. The developers accept " +
+        "no liability for loss of data or damages arising from its use.\n\n" +
+
+        "© 2026 Survey Sentence Generator. All rights reserved.";
 
     // ── Helpers ───────────────────────────────────────────────────────────────
     private (string LB, string LF, string AB, string AF) GetCatColor(int catIdx)
