@@ -1506,6 +1506,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Missing package",
                                  "Run:  pip install openai\n\nThen restart.")
             return
+        if not str(GROQ_API_KEY or "").strip():
+            log.warning("Clean requested but no Groq API key is configured")
+            self._status_label.setText("Clean unavailable: no Groq API key set")
+            QMessageBox.information(
+                self, "Groq API key not set",
+                "Clean needs a Groq API key, and none is configured.\n\n"
+                "Set the GROQ_API_KEY environment variable and restart the "
+                "app, or put GROQ_API_KEY = \"...\" in api_keys.py next to "
+                "main.py before running build.py.\n\n"
+                "Free keys are available at console.groq.com. "
+                "Everything else in the app works without one.",
+            )
+            return
         p  = self._p()
         fs = self.settings.get("font_size", 14)
         self.clean_btn.setEnabled(False)
