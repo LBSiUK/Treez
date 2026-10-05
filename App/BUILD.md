@@ -16,19 +16,21 @@ Restart your terminal after installing.
 
 ## Run in development
 
+From the root of your clone:
+
 ```powershell
-cd C:\Users\leonb\Treez\App
+cd App
 dotnet run
 ```
 
 ## Publish as single .exe
 
 ```powershell
-cd C:\Users\leonb\Treez\App
+cd App
 dotnet publish -c Release -r win-x64 --self-contained -o ..\dist\
 ```
 
-The output exe will be at `C:\Users\leonb\Treez\dist\SurveySentenceGenerator.exe`.
+The output exe will be at `dist\SurveySentenceGenerator.exe` in the repo root (the same name the Python build uses, so move one aside if you build both).
 
 ## Data location
 
