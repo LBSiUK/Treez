@@ -15,3 +15,13 @@ App/obj/
 
 # Misc
 runcommands.txt
+
+# Local build/test folders (build.py uses _tmp/ when %TEMP% is not set)
+_tmp/
+venv/
+.venv/
+*.exe
+
+# OS junk
+.DS_Store
+Thumbs.db
