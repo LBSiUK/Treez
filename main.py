@@ -10,6 +10,7 @@ import logging
 import os
 import socket
 import socketserver as _sserver
+import subprocess
 import sys
 import threading
 
@@ -46,6 +47,11 @@ try:
     QR_OK = True
 except ImportError:
     QR_OK = False
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC     = sys.platform == "darwin"
+# Hide console windows for helper processes (the flag only exists on Windows)
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.join(
@@ -329,7 +335,7 @@ def _perform_update(exe_url: str):
     )
     with open(bat_path, "w") as f:
         f.write(bat)
-    subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
+    subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=_NO_WINDOW)
     sys.exit(0)
 
 
@@ -411,6 +417,10 @@ def _find_cloudflared() -> "str | None":
 
 def _download_cloudflared(on_progress) -> str:
     import urllib.request
+    if not IS_WINDOWS:
+        # The auto-download fetches the Windows build; elsewhere use a system install
+        raise RuntimeError("cloudflared not found. Install it first "
+                           "(macOS: brew install cloudflared)")
     on_progress(0)
     with urllib.request.urlopen(_CF_DL, timeout=60) as resp:
         total    = int(resp.headers.get("Content-Length") or 0)
@@ -440,7 +450,7 @@ def _launch_cf_tunnel(port: int, on_url, on_error) -> "subprocess.Popen":
         [cf, "--no-autoupdate", "tunnel", "--url", f"http://localhost:{port}"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=_NO_WINDOW,
     )
     log.info("cloudflared PID %d started", proc.pid)
 
@@ -1239,7 +1249,7 @@ class MainWindow(QMainWindow):
 
     def _prompt_update(self, tag: str, exe_url: str):
         frozen = getattr(sys, "frozen", False)
-        if frozen:
+        if frozen and IS_WINDOWS:
             ok = QMessageBox.question(
                 self, "Update available",
                 f"Version {tag} is available.\n\nDownload and restart now?",
@@ -1471,7 +1481,7 @@ class MainWindow(QMainWindow):
     def _do_paste(self, sentence: str):
         try:
             pyperclip.copy(sentence)
-            pyautogui.hotkey("ctrl", "v")
+            pyautogui.hotkey("command" if IS_MAC else "ctrl", "v")
         except Exception as exc:
             self.showNormal()
             QMessageBox.critical(self, "Paste error", str(exc))
