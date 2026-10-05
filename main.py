@@ -935,6 +935,9 @@ class MainWindow(QMainWindow):
         sb.addWidget(self._status_label)
 
         self._rebuild_tabs()
+        # New indicator label and Clean button: forget the last state so the
+        # next poll repaints them (otherwise both reset after a Field Mode toggle)
+        self._wifi_online = None
         self._poll_wifi()
         self._wifi_timer.start()
 
