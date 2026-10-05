@@ -684,6 +684,7 @@ class MainWindow(QMainWindow):
         self._mobile_win: "MobileWindow | None"    = None
         self._mobile_updating = False
         self._wifi_online: bool | None = None
+        self._pending_update: "tuple[str, str] | None" = None
 
         self.setWindowTitle("Survey Sentence Generator")
         self.showMaximized()
@@ -718,6 +719,9 @@ class MainWindow(QMainWindow):
             )
 
         self._build_ui()
+
+        # Check GitHub for a newer release once per launch
+        threading.Thread(target=self._bg_update_check, daemon=True).start()
 
     # ── Palette ────────────────────────────────────────────────────────────────
 
@@ -804,6 +808,9 @@ class MainWindow(QMainWindow):
             hdr_layout.setSpacing(8)
 
         self.header_layout = hdr_layout
+        if self._pending_update:
+            # header was rebuilt (e.g. Field Mode toggle): keep the update button
+            self._show_update_banner(*self._pending_update)
         root_layout.addWidget(header)
         root_layout.addWidget(_hline())
 
@@ -1118,8 +1125,6 @@ class MainWindow(QMainWindow):
         if self._tab_widgets:
             self._select_tab(next(iter(self._tab_widgets)))
 
-        threading.Thread(target=self._bg_update_check, daemon=True).start()
-
     def _make_tab_page(self, cat: dict, fs: int, cat_idx: int,
                        cat_bg: str, cat_fg: str, p: dict) -> QScrollArea:
         scroll = QScrollArea()
@@ -1234,7 +1239,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _show_update_banner(self, tag: str, exe_url: str):
-        p   = self._p()
+        self._pending_update = (tag, exe_url)
         btn = QPushButton(f"  ↑ Update v{tag}  ")
         btn.setCursor(Qt.PointingHandCursor)
         btn.setStyleSheet(
