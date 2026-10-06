@@ -10,6 +10,7 @@ import logging
 import os
 import socket
 import socketserver as _sserver
+import subprocess
 import sys
 import threading
 
@@ -46,6 +47,11 @@ try:
     QR_OK = True
 except ImportError:
     QR_OK = False
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC     = sys.platform == "darwin"
+# Hide console windows for helper processes (the flag only exists on Windows)
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.join(
@@ -329,7 +335,7 @@ def _perform_update(exe_url: str):
     )
     with open(bat_path, "w") as f:
         f.write(bat)
-    subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
+    subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=_NO_WINDOW)
     sys.exit(0)
 
 
@@ -411,6 +417,10 @@ def _find_cloudflared() -> "str | None":
 
 def _download_cloudflared(on_progress) -> str:
     import urllib.request
+    if not IS_WINDOWS:
+        # The auto-download fetches the Windows build; elsewhere use a system install
+        raise RuntimeError("cloudflared not found. Install it first "
+                           "(macOS: brew install cloudflared)")
     on_progress(0)
     with urllib.request.urlopen(_CF_DL, timeout=60) as resp:
         total    = int(resp.headers.get("Content-Length") or 0)
@@ -440,7 +450,7 @@ def _launch_cf_tunnel(port: int, on_url, on_error) -> "subprocess.Popen":
         [cf, "--no-autoupdate", "tunnel", "--url", f"http://localhost:{port}"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=_NO_WINDOW,
     )
     log.info("cloudflared PID %d started", proc.pid)
 
@@ -674,6 +684,7 @@ class MainWindow(QMainWindow):
         self._mobile_win: "MobileWindow | None"    = None
         self._mobile_updating = False
         self._wifi_online: bool | None = None
+        self._pending_update: "tuple[str, str] | None" = None
 
         self.setWindowTitle("Survey Sentence Generator")
         self.showMaximized()
@@ -708,6 +719,9 @@ class MainWindow(QMainWindow):
             )
 
         self._build_ui()
+
+        # Check GitHub for a newer release once per launch
+        threading.Thread(target=self._bg_update_check, daemon=True).start()
 
     # ── Palette ────────────────────────────────────────────────────────────────
 
@@ -794,6 +808,9 @@ class MainWindow(QMainWindow):
             hdr_layout.setSpacing(8)
 
         self.header_layout = hdr_layout
+        if self._pending_update:
+            # header was rebuilt (e.g. Field Mode toggle): keep the update button
+            self._show_update_banner(*self._pending_update)
         root_layout.addWidget(header)
         root_layout.addWidget(_hline())
 
@@ -918,6 +935,9 @@ class MainWindow(QMainWindow):
         sb.addWidget(self._status_label)
 
         self._rebuild_tabs()
+        # New indicator label and Clean button: forget the last state so the
+        # next poll repaints them (otherwise both reset after a Field Mode toggle)
+        self._wifi_online = None
         self._poll_wifi()
         self._wifi_timer.start()
 
@@ -1108,8 +1128,6 @@ class MainWindow(QMainWindow):
         if self._tab_widgets:
             self._select_tab(next(iter(self._tab_widgets)))
 
-        threading.Thread(target=self._bg_update_check, daemon=True).start()
-
     def _make_tab_page(self, cat: dict, fs: int, cat_idx: int,
                        cat_bg: str, cat_fg: str, p: dict) -> QScrollArea:
         scroll = QScrollArea()
@@ -1224,7 +1242,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _show_update_banner(self, tag: str, exe_url: str):
-        p   = self._p()
+        self._pending_update = (tag, exe_url)
         btn = QPushButton(f"  ↑ Update v{tag}  ")
         btn.setCursor(Qt.PointingHandCursor)
         btn.setStyleSheet(
@@ -1239,7 +1257,7 @@ class MainWindow(QMainWindow):
 
     def _prompt_update(self, tag: str, exe_url: str):
         frozen = getattr(sys, "frozen", False)
-        if frozen:
+        if frozen and IS_WINDOWS:
             ok = QMessageBox.question(
                 self, "Update available",
                 f"Version {tag} is available.\n\nDownload and restart now?",
@@ -1471,7 +1489,7 @@ class MainWindow(QMainWindow):
     def _do_paste(self, sentence: str):
         try:
             pyperclip.copy(sentence)
-            pyautogui.hotkey("ctrl", "v")
+            pyautogui.hotkey("command" if IS_MAC else "ctrl", "v")
         except Exception as exc:
             self.showNormal()
             QMessageBox.critical(self, "Paste error", str(exc))
@@ -1505,6 +1523,19 @@ class MainWindow(QMainWindow):
         if not AI_OK:
             QMessageBox.critical(self, "Missing package",
                                  "Run:  pip install openai\n\nThen restart.")
+            return
+        if not str(GROQ_API_KEY or "").strip():
+            log.warning("Clean requested but no Groq API key is configured")
+            self._status_label.setText("Clean unavailable: no Groq API key set")
+            QMessageBox.information(
+                self, "Groq API key not set",
+                "Clean needs a Groq API key, and none is configured.\n\n"
+                "Set the GROQ_API_KEY environment variable and restart the "
+                "app, or put GROQ_API_KEY = \"...\" in api_keys.py next to "
+                "main.py before running build.py.\n\n"
+                "Free keys are available at console.groq.com. "
+                "Everything else in the app works without one.",
+            )
             return
         p  = self._p()
         fs = self.settings.get("font_size", 14)

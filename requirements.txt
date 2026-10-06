@@ -1,0 +1,6 @@
+# Runtime packages for running main.py from source (build.py installs these itself)
+pyside6
+pyautogui
+pyperclip
+openai
+qrcode

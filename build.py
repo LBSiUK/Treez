@@ -3,19 +3,25 @@ Build script — compiles main.py into a standalone Windows executable.
 Run with: python build.py
 
 Output: dist/SurveySentenceGenerator.exe
+(On macOS/Linux it builds a native binary instead, handy for checking the packaging.)
 """
 import subprocess
 import sys
 import os
 import venv
 
+IS_WINDOWS = sys.platform == "win32"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMP_DIR = os.path.join(os.environ.get("TEMP", os.path.join(BASE_DIR, "_tmp")), "SurveyGenBuild")
 VENV_DIR = os.path.join(TEMP_DIR, "venv")
-VENV_PY  = os.path.join(VENV_DIR, "Scripts", "python.exe")
+if IS_WINDOWS:
+    VENV_PY = os.path.join(VENV_DIR, "Scripts", "python.exe")
+else:
+    VENV_PY = os.path.join(VENV_DIR, "bin", "python")
 
 ICON     = os.path.join(BASE_DIR, "treez.ico")
-ADD_DATA = f"{ICON};."
+ADD_DATA = f"{ICON}{os.pathsep}."   # "icon;." on Windows
 
 PACKAGES = [
     "pyinstaller",
@@ -25,6 +31,8 @@ PACKAGES = [
     "openai",
     "qrcode",
 ]
+if not IS_WINDOWS:
+    PACKAGES.append("pillow")   # PyInstaller needs it to convert the .ico icon
 
 # ── 1. Create a clean venv ────────────────────────────────────────────────────
 print("Creating clean virtual environment...")
@@ -66,7 +74,8 @@ print("Building executable...")
 result = subprocess.run(cmd, cwd=BASE_DIR)
 
 if result.returncode == 0:
-    exe = os.path.join(BASE_DIR, "dist", "SurveySentenceGenerator.exe")
+    exe_name = "SurveySentenceGenerator.exe" if IS_WINDOWS else "SurveySentenceGenerator"
+    exe = os.path.join(BASE_DIR, "dist", exe_name)
     print(f"\nDone! Executable at:\n  {exe}")
     print("(phrases, settings, and logs are stored automatically in %APPDATA%)")
 else:
